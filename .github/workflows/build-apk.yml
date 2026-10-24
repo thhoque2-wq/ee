@@ -1,8 +1,5 @@
 name: Build AdBlock Pro APK
 
-# এই একটি ফাইলই যথেষ্ট — প্রজেক্টের সব সোর্স কোড নিচের স্টেপগুলো নিজেই তৈরি করে নেয়।
-# Run: GitHub -> Actions -> "Build AdBlock Pro APK" -> Run workflow
-
 on:
   workflow_dispatch:
   push:
@@ -21,15 +18,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Prepare Android SDK (preinstalled on GitHub runner)
+      - name: Prepare Android SDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           if [ -x "$SDKM" ]; then
             yes | "$SDKM" --licenses > /dev/null || true
             "$SDKM" "platforms;android-35" "build-tools;35.0.0" || true
-          else
-            echo "sdkmanager not found, Gradle will use the SDK already on the runner"
           fi
           ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" || true
 
@@ -86,8 +80,8 @@ jobs:
                   applicationId = "com.adblockpro.app"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
 
               buildTypes {
@@ -124,6 +118,7 @@ jobs:
                   android:allowBackup="false"
                   android:icon="@drawable/ic_launcher"
                   android:label="AdBlock Pro"
+                  android:usesCleartextTraffic="false"
                   android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
                   <activity
@@ -134,6 +129,11 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <activity
+                      android:name=".BrowserActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
 
                   <service
                       android:name=".AdBlockVpnService"
@@ -206,7 +206,12 @@ jobs:
                   "exoclick.com", "juicyads.com", "adsterra.com", "revcontent.com", "mgid.com",
                   "an.yandex.ru", "mc.yandex.ru", "hotjar.com", "mixpanel.com", "adform.net",
                   "casalemedia.com", "contextweb.com", "yieldmo.com", "sharethrough.com",
-                  "teads.tv", "adition.com", "bidswitch.net", "smartadserver.com"
+                  "teads.tv", "adition.com", "bidswitch.net", "smartadserver.com",
+                  "googletagmanager.com", "googletagservices.com", "pagead2.googlesyndication.com",
+                  "tpc.googlesyndication.com", "ad.doubleclick.net", "stats.g.doubleclick.net",
+                  "securepubads.g.doubleclick.net", "amazon-adsystem.com", "media.net",
+                  "zedo.com", "tribalfusion.com", "adroll.com", "bidvertiser.com",
+                  "adcolony.com", "unityads.unity3d.com", "applovin.com", "vungle.com"
               )
 
               fun listFile(ctx: Context): File = File(ctx.filesDir, "hosts.txt")
@@ -221,9 +226,7 @@ jobs:
                               val d = parseLine(line)
                               if (d != null) set.add(d)
                           }
-                      } catch (e: Exception) {
-                          // ignore a broken list file, built-in list still works
-                      }
+                      } catch (e: Exception) { }
                   }
                   domains = set
                   size = set.size
@@ -247,7 +250,7 @@ jobs:
 
               fun isBlocked(name: String): Boolean {
                   val set = domains
-                  var d = name
+                  var d = name.lowercase()
                   while (true) {
                       if (set.contains(d)) return true
                       val i = d.indexOf('.')
@@ -256,7 +259,6 @@ jobs:
                   }
               }
 
-              /** Downloads a hosts-format list, saves it, reloads and returns the domain count. */
               fun download(ctx: Context, url: String): Int {
                   val tmp = File(ctx.filesDir, "hosts.tmp")
                   val conn = URL(url).openConnection() as HttpURLConnection
@@ -289,8 +291,6 @@ jobs:
           import java.util.Arrays
 
           object DnsUtil {
-
-              /** Returns (queried name in lower case, offset right after the question section) or null. */
               fun parseQuestion(dns: ByteArray, len: Int): Pair<String, Int>? {
                   if (len < 17) return null
                   var pos = 12
@@ -298,66 +298,47 @@ jobs:
                   while (true) {
                       if (pos >= len) return null
                       val l = dns[pos].toInt() and 0xFF
-                      if (l == 0) {
-                          pos++
-                          break
-                      }
+                      if (l == 0) { pos++; break }
                       if ((l and 0xC0) != 0) return null
                       pos++
                       if (pos + l > len) return null
                       if (sb.isNotEmpty()) sb.append('.')
-                      for (i in 0 until l) {
-                          sb.append((dns[pos + i].toInt() and 0xFF).toChar())
-                      }
+                      for (i in 0 until l) sb.append((dns[pos + i].toInt() and 0xFF).toChar())
                       pos += l
                   }
                   if (pos + 4 > len) return null
                   return Pair(sb.toString().lowercase(), pos + 4)
               }
 
-              /** Builds an NXDOMAIN reply for the given query (header + question only). */
               fun nxdomain(query: ByteArray, qEnd: Int): ByteArray {
                   val r = query.copyOf(qEnd)
                   val b2 = query[2].toInt()
-                  // QR=1, keep opcode and RD
                   r[2] = (0x80 or (b2 and 0x79)).toByte()
-                  // RA=1, RCODE=3 (NXDOMAIN)
                   r[3] = (0x80 or 0x03).toByte()
-                  // ANCOUNT, NSCOUNT, ARCOUNT = 0
                   Arrays.fill(r, 6, 12, 0.toByte())
                   return r
               }
 
-              /** Wraps a DNS payload into an IPv4 + UDP packet that answers the given request packet. */
               fun buildPacket(req: ByteArray, ihl: Int, dns: ByteArray): ByteArray {
                   val udpLen = 8 + dns.size
                   val total = 20 + udpLen
                   val p = ByteArray(total)
                   p[0] = 0x45.toByte()
-                  p[1] = 0
                   p[2] = (total shr 8).toByte()
                   p[3] = (total and 0xFF).toByte()
-                  p[4] = 0
-                  p[5] = 0
-                  p[6] = 0x40.toByte()
-                  p[7] = 0
                   p[8] = 64
                   p[9] = 17
-                  // source = original destination, destination = original source
                   System.arraycopy(req, 16, p, 12, 4)
                   System.arraycopy(req, 12, p, 16, 4)
                   val ck = checksum(p, 0, 20)
                   p[10] = (ck shr 8).toByte()
                   p[11] = (ck and 0xFF).toByte()
-                  // UDP: swap ports
                   p[20] = req[ihl + 2]
                   p[21] = req[ihl + 3]
                   p[22] = req[ihl]
                   p[23] = req[ihl + 1]
                   p[24] = (udpLen shr 8).toByte()
                   p[25] = (udpLen and 0xFF).toByte()
-                  p[26] = 0
-                  p[27] = 0
                   System.arraycopy(dns, 0, p, 28, dns.size)
                   return p
               }
@@ -369,9 +350,7 @@ jobs:
                       sum += (((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)).toLong()
                       i += 2
                   }
-                  while ((sum shr 16) != 0L) {
-                      sum = (sum and 0xFFFFL) + (sum shr 16)
-                  }
+                  while ((sum shr 16) != 0L) sum = (sum and 0xFFFFL) + (sum shr 16)
                   return (sum.inv() and 0xFFFFL).toInt()
               }
           }
@@ -400,10 +379,6 @@ jobs:
           import java.util.concurrent.Executors
           import java.util.concurrent.atomic.AtomicLong
 
-          /**
-           * Local DNS-filtering VPN. Only DNS traffic (to a virtual DNS address) is routed into the tunnel.
-           * Blocked domains get an NXDOMAIN answer, everything else is forwarded to a real DNS server.
-           */
           class AdBlockVpnService : VpnService() {
 
               companion object {
@@ -414,9 +389,7 @@ jobs:
                   private const val VIRTUAL_DNS = "10.8.0.1"
                   private val UPSTREAMS = listOf("1.1.1.1", "8.8.8.8")
 
-                  @Volatile
-                  var running = false
-
+                  @Volatile var running = false
                   val blocked = AtomicLong(0)
                   val allowed = AtomicLong(0)
               }
@@ -468,13 +441,8 @@ jobs:
                           .addRoute(VIRTUAL_DNS, 32)
                           .setMtu(1500)
                           .establish()
-                  } catch (e: Exception) {
-                      null
-                  }
-                  if (pfd == null) {
-                      stopVpn()
-                      return
-                  }
+                  } catch (e: Exception) { null }
+                  if (pfd == null) { stopVpn(); return }
                   tun = pfd
                   running = true
                   pool = Executors.newFixedThreadPool(8)
@@ -492,17 +460,11 @@ jobs:
                       while (running) {
                           val n = input.read(buf)
                           if (n < 0) break
-                          if (n == 0) {
-                              Thread.sleep(10)
-                              continue
-                          }
+                          if (n == 0) { Thread.sleep(10); continue }
                           handlePacket(buf.copyOf(n), n, output)
                       }
                   } catch (e: Exception) {
-                      // tunnel closed
-                  } finally {
-                      running = false
-                  }
+                  } finally { running = false }
               }
 
               private fun handlePacket(pkt: ByteArray, len: Int, out: FileOutputStream) {
@@ -519,7 +481,6 @@ jobs:
                   val dnsLen = end - ihl - 8
                   if (dnsLen < 12) return
                   val dns = pkt.copyOfRange(ihl + 8, ihl + 8 + dnsLen)
-
                   val q = DnsUtil.parseQuestion(dns, dns.size)
                   if (q != null && Blocklist.isBlocked(q.first)) {
                       blocked.incrementAndGet()
@@ -530,9 +491,7 @@ jobs:
                   allowed.incrementAndGet()
                   try {
                       pool?.execute { forward(pkt, ihl, dns, out) }
-                  } catch (e: Exception) {
-                      // pool already shut down
-                  }
+                  } catch (e: Exception) { }
               }
 
               private fun forward(req: ByteArray, ihl: Int, dns: ByteArray, out: FileOutputStream) {
@@ -550,28 +509,17 @@ jobs:
                           write(out, DnsUtil.buildPacket(req, ihl, resp))
                           return
                       } catch (e: Exception) {
-                          // try next upstream
-                      } finally {
-                          socket?.close()
-                      }
+                      } finally { socket?.close() }
                   }
               }
 
               private fun write(out: FileOutputStream, data: ByteArray) {
-                  try {
-                      synchronized(out) { out.write(data) }
-                  } catch (e: Exception) {
-                      // tunnel closed
-                  }
+                  try { synchronized(out) { out.write(data) } } catch (e: Exception) { }
               }
 
               private fun stopVpn() {
                   running = false
-                  try {
-                      tun?.close()
-                  } catch (e: Exception) {
-                      // ignore
-                  }
+                  try { tun?.close() } catch (e: Exception) { }
                   tun = null
                   pool?.shutdownNow()
                   pool = null
@@ -581,19 +529,216 @@ jobs:
                   stopSelf()
               }
 
-              override fun onRevoke() {
-                  stopVpn()
-                  super.onRevoke()
-              }
+              override fun onRevoke() { stopVpn(); super.onRevoke() }
 
               override fun onDestroy() {
                   running = false
-                  try {
-                      tun?.close()
-                  } catch (e: Exception) {
-                      // ignore
-                  }
+                  try { tun?.close() } catch (e: Exception) { }
                   pool?.shutdownNow()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Create Kotlin - Browser (Ad-free WebView)
+        run: |
+          cat > adblock/app/src/main/java/com/adblockpro/app/BrowserActivity.kt <<'EOF'
+          package com.adblockpro.app
+
+          import android.app.Activity
+          import android.graphics.Bitmap
+          import android.graphics.drawable.ColorDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import java.io.ByteArrayInputStream
+
+          class BrowserActivity : Activity() {
+
+              companion object {
+                  const val HOME_URL = "https://duckduckgo.com"
+              }
+
+              private lateinit var webView: WebView
+              private lateinit var urlBar: EditText
+              private lateinit var progressBar: ProgressBar
+              private lateinit var blockedCounter: TextView
+
+              private var blockedCount = 0
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+
+                  if (Blocklist.size == 0) {
+                      Thread { Blocklist.load(applicationContext) }.start()
+                  }
+
+                  val startUrl = intent.getStringExtra("url") ?: HOME_URL
+                  webView.loadUrl(startUrl)
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFFFFFFFF.toInt())
+
+                  val topBar = LinearLayout(this)
+                  topBar.orientation = LinearLayout.HORIZONTAL
+                  topBar.setPadding(dp(6), dp(8), dp(6), dp(8))
+                  topBar.setBackgroundColor(0xFF1565C0.toInt())
+                  topBar.gravity = Gravity.CENTER_VERTICAL
+
+                  val backBtn = Button(this)
+                  backBtn.text = "\u25C0"
+                  backBtn.textSize = 16f
+                  backBtn.setTextColor(0xFFFFFFFF.toInt())
+                  backBtn.setBackgroundColor(0x00000000)
+                  backBtn.setOnClickListener { if (webView.canGoBack()) webView.goBack() }
+
+                  val fwdBtn = Button(this)
+                  fwdBtn.text = "\u25B6"
+                  fwdBtn.textSize = 16f
+                  fwdBtn.setTextColor(0xFFFFFFFF.toInt())
+                  fwdBtn.setBackgroundColor(0x00000000)
+                  fwdBtn.setOnClickListener { if (webView.canGoForward()) webView.goForward() }
+
+                  urlBar = EditText(this)
+                  urlBar.hint = "Search or URL"
+                  urlBar.textSize = 13f
+                  urlBar.setSingleLine()
+                  urlBar.imeOptions = EditorInfo.IME_ACTION_GO
+                  urlBar.setBackgroundColor(0xFFFFFFFF.toInt())
+                  urlBar.setPadding(dp(10), dp(6), dp(10), dp(6))
+                  val urlLp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  urlLp.setMargins(dp(4), 0, dp(4), 0)
+                  urlBar.layoutParams = urlLp
+                  urlBar.setOnEditorActionListener { _, actionId, _ ->
+                      if (actionId == EditorInfo.IME_ACTION_GO) {
+                          navigate(urlBar.text.toString()); true
+                      } else false
+                  }
+
+                  val goBtn = Button(this)
+                  goBtn.text = "GO"
+                  goBtn.textSize = 13f
+                  goBtn.setTextColor(0xFFFFFFFF.toInt())
+                  goBtn.setBackgroundColor(0x00000000)
+                  goBtn.setOnClickListener { navigate(urlBar.text.toString()) }
+
+                  topBar.addView(backBtn)
+                  topBar.addView(fwdBtn)
+                  topBar.addView(urlBar)
+                  topBar.addView(goBtn)
+
+                  blockedCounter = TextView(this)
+                  blockedCounter.textSize = 12f
+                  blockedCounter.setTextColor(0xFF2E7D32.toInt())
+                  blockedCounter.setPadding(dp(12), dp(4), dp(12), dp(4))
+                  blockedCounter.setBackgroundColor(0xFFE8F5E9.toInt())
+                  blockedCounter.text = "Blocked on this page: 0"
+
+                  progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  progressBar.max = 100
+                  progressBar.progressDrawable = ColorDrawable(0xFF2E7D32.toInt())
+                  progressBar.visibility = View.GONE
+
+                  webView = WebView(this)
+                  val webLp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                  )
+                  webView.layoutParams = webLp
+
+                  val s = webView.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.loadWithOverviewMode = true
+                  s.useWideViewPort = true
+                  s.setSupportZoom(true)
+                  s.builtInZoomControls = true
+                  s.displayZoomControls = false
+                  s.mediaPlaybackRequiresUserGesture = true
+
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(
+                          view: WebView?,
+                          request: WebResourceRequest?
+                      ): WebResourceResponse? {
+                          val host = request?.url?.host ?: return null
+                          if (Blocklist.isBlocked(host)) {
+                              runOnUiThread {
+                                  blockedCount++
+                                  blockedCounter.text = "Blocked on this page: $blockedCount"
+                              }
+                              return WebResourceResponse(
+                                  "text/plain", "utf-8", ByteArrayInputStream(ByteArray(0))
+                              )
+                          }
+                          return null
+                      }
+
+                      override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                          super.onPageStarted(view, url, favicon)
+                          urlBar.setText(url)
+                          blockedCount = 0
+                          blockedCounter.text = "Blocked on this page: 0"
+                      }
+
+                      override fun onPageFinished(view: WebView?, url: String?) {
+                          super.onPageFinished(view, url)
+                          progressBar.visibility = View.GONE
+                      }
+                  }
+
+                  webView.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                          super.onProgressChanged(view, newProgress)
+                          progressBar.progress = newProgress
+                          progressBar.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
+                      }
+                  }
+
+                  root.addView(topBar)
+                  root.addView(blockedCounter)
+                  root.addView(progressBar)
+                  root.addView(webView)
+                  setContentView(root)
+              }
+
+              private fun navigate(input: String) {
+                  var url = input.trim()
+                  if (url.isEmpty()) return
+                  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                      url = if (url.contains('.') && !url.contains(' ')) {
+                          "https://$url"
+                      } else {
+                          "https://duckduckgo.com/?q=" + Uri.encode(url)
+                      }
+                  }
+                  webView.loadUrl(url)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
                   super.onDestroy()
               }
           }
@@ -655,15 +800,8 @@ jobs:
                   }
               }
 
-              override fun onResume() {
-                  super.onResume()
-                  handler.post(ticker)
-              }
-
-              override fun onPause() {
-                  super.onPause()
-                  handler.removeCallbacks(ticker)
-              }
+              override fun onResume() { super.onResume(); handler.post(ticker) }
+              override fun onPause() { super.onPause(); handler.removeCallbacks(ticker) }
 
               private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -672,11 +810,11 @@ jobs:
                   root.orientation = LinearLayout.VERTICAL
                   root.gravity = Gravity.CENTER_HORIZONTAL
                   root.setBackgroundColor(0xFFF5F7FA.toInt())
-                  root.setPadding(dp(24), dp(56), dp(24), dp(24))
+                  root.setPadding(dp(24), dp(40), dp(24), dp(24))
 
                   val title = TextView(this)
                   title.text = "AdBlock Pro"
-                  title.textSize = 30f
+                  title.textSize = 28f
                   title.typeface = Typeface.DEFAULT_BOLD
                   title.setTextColor(0xFF1565C0.toInt())
 
@@ -703,32 +841,50 @@ jobs:
                   listInfo.gravity = Gravity.CENTER
                   listInfo.setTextColor(0xFF607D8B.toInt())
 
+                  val browserBtn = Button(this)
+                  browserBtn.text = "BROWSE AD-FREE"
+                  browserBtn.textSize = 16f
+                  browserBtn.typeface = Typeface.DEFAULT_BOLD
+                  browserBtn.setTextColor(0xFFFFFFFF.toInt())
+                  val bbg = GradientDrawable()
+                  bbg.cornerRadius = dp(8).toFloat()
+                  bbg.setColor(0xFF2E7D32.toInt())
+                  browserBtn.background = bbg
+                  browserBtn.setPadding(dp(24), dp(12), dp(24), dp(12))
+                  browserBtn.setOnClickListener {
+                      startActivity(Intent(this, BrowserActivity::class.java))
+                  }
+
                   updateBtn = Button(this)
                   updateBtn.text = "UPDATE FILTER LIST"
 
                   val note = TextView(this)
-                  note.text = "If ads still show, turn off Private DNS in Android Settings > Network."
+                  note.text = "VPN mode blocks ads system-wide via DNS.\nFor web: tap BROWSE AD-FREE above."
                   note.textSize = 12f
                   note.gravity = Gravity.CENTER
                   note.setTextColor(0xFF90A4AE.toInt())
 
                   val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
-                  val lpToggle = LinearLayout.LayoutParams(dp(170), dp(170))
-                  lpToggle.topMargin = dp(36)
+                  val lpToggle = LinearLayout.LayoutParams(dp(150), dp(150))
+                  lpToggle.topMargin = dp(28)
+
                   val lpStats = LinearLayout.LayoutParams(wrap, wrap)
-                  lpStats.topMargin = dp(32)
+                  lpStats.topMargin = dp(24)
                   val lpInfo = LinearLayout.LayoutParams(wrap, wrap)
                   lpInfo.topMargin = dp(8)
+                  val lpBrowser = LinearLayout.LayoutParams(wrap, wrap)
+                  lpBrowser.topMargin = dp(28)
                   val lpBtn = LinearLayout.LayoutParams(wrap, wrap)
-                  lpBtn.topMargin = dp(24)
+                  lpBtn.topMargin = dp(16)
                   val lpNote = LinearLayout.LayoutParams(wrap, wrap)
-                  lpNote.topMargin = dp(24)
+                  lpNote.topMargin = dp(20)
 
                   root.addView(title)
                   root.addView(status)
                   root.addView(toggle, lpToggle)
                   root.addView(stats, lpStats)
                   root.addView(listInfo, lpInfo)
+                  root.addView(browserBtn, lpBrowser)
                   root.addView(updateBtn, lpBtn)
                   root.addView(note, lpNote)
                   setContentView(root)
@@ -740,11 +896,7 @@ jobs:
                           startService(stop)
                       } else {
                           val prep = VpnService.prepare(this)
-                          if (prep != null) {
-                              startActivityForResult(prep, reqVpn)
-                          } else {
-                              startVpn()
-                          }
+                          if (prep != null) startActivityForResult(prep, reqVpn) else startVpn()
                       }
                   }
 
@@ -770,9 +922,7 @@ jobs:
               @Deprecated("Deprecated in Java")
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                   super.onActivityResult(requestCode, resultCode, data)
-                  if (requestCode == reqVpn && resultCode == RESULT_OK) {
-                      startVpn()
-                  }
+                  if (requestCode == reqVpn && resultCode == RESULT_OK) startVpn()
               }
 
               private fun startVpn() {
@@ -783,7 +933,7 @@ jobs:
 
               private fun refresh() {
                   val on = AdBlockVpnService.running
-                  status.text = if (on) "Protection ON" else "Protection OFF"
+                  status.text = if (on) "VPN: ON" else "VPN: OFF"
                   status.setTextColor(if (on) 0xFF2E7D32.toInt() else 0xFFC62828.toInt())
                   toggle.text = if (on) "STOP" else "START"
                   (toggle.background as GradientDrawable)
